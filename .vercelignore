@@ -1,0 +1,5 @@
+# Exclude the heavy tool / vendor trees from the Vercel function bundle.
+tools/
+vendor/
+data/
+*.zip

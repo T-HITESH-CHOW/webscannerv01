@@ -1,0 +1,3 @@
+# Exclude heavy non-build artifacts from the frontend function bundle.
+.venv
+node_modules/.cache

@@ -1,930 +1,458 @@
 """
-Report Generator v1 — turns raw normalized findings into a detailed English report.
+LLM Service v01
+----------------
+Pluggable report generation backend for the scan/engagement reports.
 
-Two layers:
+Supported providers
+-------------------
+  anthropic  Claude Haiku / Sonnet / Opus via the Anthropic Messages API.
+  openai     GPT-4o / GPT-4 Turbo via the OpenAI Chat Completions API.
+  none       Deterministic, knowledge-base report with no external API calls.
 
-1. **Deterministic** (always runs, no API key needed): sorts every finding
-   critical -> high -> medium -> low -> info, de-duplicates engine overlap,
-   assigns a fix priority, maps each finding to a plain-English explanation /
-   impact / remediation from the knowledge base below, and writes an executive
-   summary plus a Markdown export.
-
-2. **LLM enrichment** (optional): when `LLM_API_KEY` is set, the prose for each
-   finding is rewritten by Claude. Any failure silently falls back to layer 1 so
-   a report is always produced.
+Configuration
+-------------
+Set ``LLM_PROVIDER`` in ``.env`` (or the Vercel env UI) to one of the above.
+When ``none`` is selected the service is entirely offline and never opens a
+network connection or imports a provider SDK at module load time — which is
+what makes the Vercel deployment path survivable without an LLM key configured.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
+import os
+import re
+import time
 from datetime import datetime
-from typing import Optional
+from typing import Any, Callable, Optional
 
 from app.config import get_settings
 from app.models.schemas import (
-    LLMFinding,
+    EngagementSummary,
     NormalizedFinding,
-    ScanReport,
-    ScanType,
     Severity,
-    severity_rank,
+    ScanReport,
 )
 
+logger = logging.getLogger(__name__)
 settings = get_settings()
 
-SEVERITY_TITLE = {
-    Severity.CRITICAL: "Critical",
-    Severity.HIGH: "High",
-    Severity.MEDIUM: "Medium",
-    Severity.LOW: "Low",
-    Severity.INFO: "Informational",
-}
 
-# How fast each severity should be dealt with (used in the roadmap section).
-SEVERITY_SLA = {
-    Severity.CRITICAL: "Fix now — before the next deploy (24 hours)",
-    Severity.HIGH: "Fix within 7 days",
-    Severity.MEDIUM: "Fix within 30 days",
-    Severity.LOW: "Fix within the next release cycle",
-    Severity.INFO: "Review and document; no immediate action",
-}
+# =============================================================================
+# Provider instantiation — lazy, so ``LLM_PROVIDER=none`` never touches a
+# provider SDK at import time. ``None`` is fine on Vercel when you only use
+# the deterministic path.
+# =============================================================================
 
 
-# ---------------------------------------------------------------------------
-# Knowledge base: keyword -> plain-English explanation / impact / remediation
-# ---------------------------------------------------------------------------
-
-class Topic:
-    __slots__ = ("name", "patterns", "summary", "impact", "fix", "owasp")
-
-    def __init__(self, name, patterns, summary, impact, fix, owasp=""):
-        self.name = name
-        self.patterns = [p.lower() for p in patterns]
-        self.summary = summary
-        self.impact = impact
-        self.fix = fix
-        self.owasp = owasp
-
-
-TOPICS: tuple[Topic, ...] = (
-    Topic(
-        "SQL injection",
-        ["sql injection", "sqli", "formatted-sql", "concat.*query", "sql query"],
-        "Application input reaches a database query without parameterisation. The "
-        "query text and the data are built from the same string, so whatever the "
-        "user sends becomes part of the command the database executes.",
-        "An attacker who controls part of a SQL statement can read tables they were "
-        "never meant to see, modify or delete rows, bypass login checks with a "
-        "crafted condition, and on some database engines read files or run operating "
-        "system commands. A single injectable parameter is usually enough for full "
-        "data disclosure, so this is treated as a top-priority issue.",
-        "1. Replace string concatenation/formatting with parameterised queries or an "
-        "ORM binding layer (e.g. `cursor.execute('... WHERE id = ?', (user_id,))`).\n"
-        "2. Never build identifiers (table/column names) from user input; map them "
-        "through an allowlist.\n"
-        "3. Give the application database account only the privileges it needs "
-        "(no DROP, no FILE, no cross-schema access).\n"
-        "4. Add regression tests that send quotes and boolean logic in every input.",
-        "A03:2021 Injection",
-    ),
-    Topic(
-        "Cross-site scripting",
-        ["xss", "cross site scripting", "cross-site scripting", "render_template_string", "output encoding"],
-        "User-controlled data is written into an HTML response without contextual "
-        "output encoding, so the browser treats it as markup or script rather than "
-        "text. Template injection variants are worse: the input is evaluated by the "
-        "templating engine itself.",
-        "Script running in your origin can read cookies and tokens, submit requests "
-        "as the victim, rewrite the page (fake login forms), and pivot into internal "
-        "APIs the browser can reach. It converts a single crafted link into account "
-        "takeover for whoever clicks it.",
-        "1. Encode output for the exact context it lands in (HTML body, attribute, "
-        "JavaScript, URL) using the framework's auto-escaping.\n"
-        "2. Never pass user input to `render_template_string`, `eval`, or raw HTML "
-        "insertion APIs; use fixed templates with data parameters.\n"
-        "3. Add a Content-Security-Policy that forbids inline script and unexpected "
-        "sources as a second layer.\n"
-        "4. Mark session cookies HttpOnly so script cannot read them.",
-        "A03:2021 Injection",
-    ),
-    Topic(
-        "Server-side template injection",
-        ["ssti", "template injection"],
-        "User input is compiled as a template expression instead of being treated as "
-        "data, so the input can contain template syntax that the server executes.",
-        "Template engines usually expose enough of the host language to walk object "
-        "attributes, which commonly escalates from information disclosure to remote "
-        "code execution on the application server.",
-        "1. Pass user input only as template *data*.\n"
-        "2. Use a sandboxed template environment and disable dangerous globals.\n"
-        "3. Reject or escape template delimiters in user input as defence in depth.",
-        "A03:2021 Injection",
-    ),
-    Topic(
-        "Hardcoded secret",
-        ["hardcoded", "hard-coded", "api key", "api_key", "secret key", "private key",
-         "credential", "password", "leaked key"],
-        "A credential was found in source code, configuration or page content. "
-        "Anything in the repository or served to a browser is readable by everyone "
-        "who can reach it, and it survives in git history after deletion.",
-        "Leaked keys allow direct access to the third-party or internal service they "
-        "belong to: cloud billing, database contents, email sending, or the "
-        "application's own authentication. Automated scanners harvest these from "
-        "public repositories within minutes of a push.",
-        "1. Revoke and rotate the exposed credential first — assume it is already "
-        "compromised.\n"
-        "2. Move secrets to environment variables or a secret manager.\n"
-        "3. Review provider audit logs for use from unknown IPs.\n"
-        "4. Add a pre-commit secret scanner so it cannot happen again.",
-        "A07:2021 Identification and Authentication Failures",
-    ),
-    Topic(
-        "Security headers",
-        ["missing security header", "content-security-policy", "x-frame-options",
-         "x-content-type-options", "referrer-policy", "permissions-policy"],
-        "The response is missing one or more headers that tell the browser how to "
-        "treat the page. Browsers default to permissive behaviour when a header is "
-        "absent, so the absence of a header is itself a weakness.",
-        "Without these headers the browser is more willing to run injected script, "
-        "frame the page inside an attacker's site (clickjacking), guess content "
-        "types, and leak URLs through the Referer header. None of them fix a "
-        "vulnerability on their own, but together they remove whole classes of "
-        "exploitation and are cheap to add.",
-        "1. Set the headers at the reverse proxy or application middleware so every "
-        "route inherits them.\n"
-        "2. Start CSP in report-only mode, fix what it flags, then enforce.\n"
-        "3. Keep a short allowlist of script/style/frame sources.\n"
-        "4. Add `X-Content-Type-Options: nosniff` and a restrictive Referrer-Policy "
-        "immediately — they are zero-risk.",
-        "A05:2021 Security Misconfiguration",
-    ),
-    Topic(
-        "HSTS / TLS",
-        ["strict-transport-security", "hsts", "https redirect", "upgrade to https",
-         "plain http", "transport security", "ssl", "tls", "certificate"],
-        "Transport security is not enforced: either HSTS is missing or plain HTTP is "
-        "served without upgrading to HTTPS.",
-        "On the first request the browser may speak HTTP. Anyone sharing the network "
-        "— public Wi-Fi, a compromised router, a hostile ISP — can intercept or "
-        "rewrite that request, steal session cookies, or serve a modified page. This "
-        "is the classic SSL-stripping attack.",
-        "1. Redirect all HTTP traffic to HTTPS with a 301.\n"
-        "2. Send `Strict-Transport-Security: max-age=31536000; includeSubDomains` "
-        "once HTTPS works reliably.\n"
-        "3. Mark cookies Secure.\n"
-        "4. Renew certificates automatically and monitor expiry.",
-        "A02:2021 Cryptographic Failures",
-    ),
-    Topic(
-        "Cookie flags",
-        ["cookie", "httponly", "samesite"],
-        "A cookie is issued without the Secure, HttpOnly and/or SameSite attributes.",
-        "Without Secure it travels over plain HTTP and can be sniffed. Without "
-        "HttpOnly any XSS immediately becomes session theft. Without SameSite the "
-        "browser attaches it to cross-site requests, weakening CSRF defences.",
-        "1. Set `Secure; HttpOnly; SameSite=Lax` (or `Strict`) on all session cookies.\n"
-        "2. Never store credentials or tokens in cookies readable by JavaScript.\n"
-        "3. Keep session lifetimes short and rotate the session ID on login.",
-        "A05:2021 Security Misconfiguration",
-    ),
-    Topic(
-        "CORS",
-        ["cors", "access-control-allow-origin"],
-        "The cross-origin policy allows more than it should — either a wildcard that "
-        "also permits credentials, or an arbitrary Origin reflected back.",
-        "If the API trusts any Origin and accepts cookies or bearer credentials, any "
-        "website can make the victim's browser read authenticated responses and "
-        "exfiltrate them. Effectively the same-origin policy stops protecting the "
-        "user's data.",
-        "1. Allowlist exact origins that legitimately call the API.\n"
-        "2. Never combine `Access-Control-Allow-Origin: *` with credentials.\n"
-        "3. Validate the Origin header server-side instead of echoing it.\n"
-        "4. Keep cookie-authenticated endpoints same-origin where possible.",
-        "A05:2021 Security Misconfiguration",
-    ),
-    Topic(
-        "Exposed sensitive file",
-        ["exposed sensitive", ".git", ".env", "backup", "server-status", "actuator", "swagger"],
-        "A file or endpoint that should be private is served publicly. Version "
-        "control metadata, environment files, backups and management endpoints are "
-        "the highest-value targets on a web server.",
-        "Repository metadata can reconstruct source code and its deleted secrets. An "
-        "environment file typically contains database passwords and API keys. Backups "
-        "often hold the whole application plus a data dump. Any of these can end the "
-        "engagement on its own — full source and credential disclosure.",
-        "1. Block the paths at the web server / CDN and confirm a 404 or 403.\n"
-        "2. Move secrets out of files that sit in the web root.\n"
-        "3. Rotate anything that was reachable during the exposure window.\n"
-        "4. Add deployment-time checks that fail the build if these paths are public.",
-        "A05:2021 Security Misconfiguration",
-    ),
-    Topic(
-        "Information disclosure",
-        ["disclosure", "server:", "x-powered-by", "version", "banner", "directory listing"],
-        "The server reveals product, version or directory information in responses.",
-        "Version banners let an attacker look up known CVEs for exactly that build and "
-        "choose exploits that are likely to work, without noisy trial and error. It "
-        "does not cause a breach by itself, but it shortens the path to one.",
-        "1. Remove or genericise `Server`, `X-Powered-By` and framework headers.\n"
-        "2. Disable directory listing and verbose error pages in production.\n"
-        "3. Keep the stack patched — removing the banner is not a substitute.",
-        "A05:2021 Security Misconfiguration",
-    ),
-    Topic(
-        "Exposed service / open port",
-        ["open port", "exposed sensitive service", "exposed administrative"],
-        "A network port is reachable and running a service. The severity depends on "
-        "what that service is and who can reach it.",
-        "Every reachable port is an entry point: database and cache ports can bypass "
-        "application authorisation entirely, remote-access ports invite brute force, "
-        "and admin interfaces assume a trusted network. Attackers map these first and "
-        "pick the weakest one.",
-        "1. Confirm the port must be reachable from this network position.\n"
-        "2. Firewall it to known source IPs, or bind it to localhost only.\n"
-        "3. Require authentication with strong credentials and rate limiting on any "
-        "management service.\n"
-        "4. Patch the running version and monitor it for brute-force attempts.",
-        "A05:2021 Security Misconfiguration",
-    ),
-    Topic(
-        "Vulnerable dependency",
-        ["cve-", "vulnerab", "dependency", "package", "library"],
-        "A third-party package in use has a known vulnerability, matched against the "
-        "version installed.",
-        "Dependencies inherit the trust of the application. A known CVE in a library "
-        "you ship is a documented attack path that any scanner can find, and the "
-        "impact ranges from denial of service to remote code execution depending on "
-        "the advisory.",
-        "1. Upgrade to the fixed version listed in the finding. If no fix exists, "
-        "apply vendor mitigations or replace the package.\n"
-        "2. Rebuild and redeploy the artefact — patching the manifest without "
-        "rebuilding leaves the vulnerable copy in the image.\n"
-        "3. Add automated dependency scanning to CI so new CVEs surface on every PR.",
-        "A06:2021 Vulnerable and Outdated Components",
-    ),
-    Topic(
-        "Infrastructure-as-code misconfiguration",
-        ["iac", "terraform", "kubernetes", "cloudformation", "dockerfile", "misconfig"],
-        "An infrastructure definition grants more access than the workload needs — "
-        "for example privileged containers, public buckets, or wildcard IAM policies.",
-        "A misconfigured template is replicated to every environment it is deployed "
-        "to, so one mistake scales into a fleet-wide weakness that no application-"
-        "layer control can compensate for.",
-        "1. Apply least privilege: scope IAM actions and resources explicitly.\n"
-        "2. Keep buckets and volumes private unless they are intentionally public.\n"
-        "3. Drop container privileges, run as non-root, and pin base images.\n"
-        "4. Add the IaC scan to CI so the gate runs before apply.",
-        "A05:2021 Security Misconfiguration",
-    ),
-    Topic(
-        "Command injection / RCE",
-        ["command injection", "rce", "remote code execution", "os command", "eval", "deserialization"],
-        "Untrusted input can influence a command or code path the server executes.",
-        "This is the most severe class of finding: the attacker runs their own code "
-        "with the application's privileges, which usually means reading the database, "
-        "reaching internal services, and owning the host.",
-        "1. Remove the shell: use argument-vector APIs instead of string commands.\n"
-        "2. Allowlist accepted values instead of sanitising.\n"
-        "3. Never deserialize untrusted data with a format that can construct "
-        "objects; prefer signed, schema-validated JSON.\n"
-        "4. Run the service with the minimum privileges and egress restrictions so "
-        "exploitation is contained.",
-        "A03:2021 Injection",
-    ),
-    Topic(
-        "Unreachable target",
-        ["did not respond", "unreachable"],
-        "The automated checks could not reach the target, so no evidence was "
-        "collected either way.",
-        "This is not a vulnerability and not a clean bill of health — it means the "
-        "assessment did not run. Treat the target as unverified.",
-        "1. Confirm DNS, port and TLS reachability from the scanning host.\n"
-        "2. Check for a WAF or IP allowlist blocking the scanner.\n"
-        "3. Re-run the scan once reachable; do not report the target as verified.",
-        "",
-    ),
-)
-
-# CWE + MITRE ATT&CK mapping per knowledge-base topic. A real pentest report
-# carries these identifiers so a developer or auditor can trace each finding to
-# a standard weakness class and adversary technique.
-CWE_BY_TOPIC: dict[str, str] = {
-    "SQL injection": "CWE-89",
-    "Cross-site scripting": "CWE-79",
-    "Template injection": "CWE-1336",
-    "Hardcoded secrets": "CWE-798",
-    "Broken access control": "CWE-284",
-    "Missing security headers": "CWE-693",
-    "Cookie security": "CWE-614",
-    "CORS misconfiguration": "CWE-942",
-    "Exposed sensitive paths": "CWE-538",
-    "Security misconfiguration": "CWE-16",
-    "Vulnerable dependency": "CWE-1395",
-    "Outdated component": "CWE-1104",
-    "TLS / transport": "CWE-319",
-    "Open port / exposed service": "CWE-1327",
-    "Information disclosure": "CWE-200",
-    "Infrastructure as code": "CWE-1188",
-    "Remote code execution": "CWE-94",
-    "Unreachable": "",
-    "General security weakness": "CWE-20",
-}
-
-MITRE_BY_TOPIC: dict[str, str] = {
-    "SQL injection": "T1190 Exploit Public-Facing Application",
-    "Cross-site scripting": "T1059.007 JavaScript",
-    "Template injection": "T1059 Command and Scripting Interpreter",
-    "Hardcoded secrets": "T1552.001 Unsecured Credentials",
-    "Broken access control": "T1078 Valid Accounts",
-    "Missing security headers": "T1185 Browser Session Hijacking",
-    "Cookie security": "T1539 Steal Web Session Cookie",
-    "CORS misconfiguration": "T1190 Exploit Public-Facing Application",
-    "Exposed sensitive paths": "T1592 Gather Victim Host Information",
-    "Security misconfiguration": "T1190 Exploit Public-Facing Application",
-    "Vulnerable dependency": "T1195 Supply Chain Compromise",
-    "Outdated component": "T1195 Supply Chain Compromise",
-    "TLS / transport": "T1040 Network Sniffing",
-    "Open port / exposed service": "T1046 Network Service Discovery",
-    "Information disclosure": "T1592 Gather Victim Host Information",
-    "Infrastructure as code": "T1190 Exploit Public-Facing Application",
-    "Remote code execution": "T1203 Exploitation for Client Execution",
-    "Unreachable": "",
-    "General security weakness": "T1190 Exploit Public-Facing Application",
-}
-
-DEFAULT_TOPIC = Topic(
-    "General security weakness",
-    [],
-    "The finding is reported by an automated check and needs manual confirmation "
-    "before it is treated as a real weakness.",
-    "Impact depends on how the affected component is used. Confirm the finding by "
-    "hand, then assess what an attacker gains if it is real.",
-    "1. Reproduce the finding manually.\n"
-    "2. Fix at the source rather than blocking the symptom.\n"
-    "3. Add a test or a linter rule so the same defect cannot come back.",
-    "",
-)
-
-
-def _find_topic(finding: NormalizedFinding) -> Topic:
-    """
-    Pick the knowledge-base entry that best matches the finding.
-
-    Title matches are weighted higher than description matches: a scanner title
-    is a precise label, while a description can mention several unrelated words
-    (an exposed .env file mentions 'password', but it is not a hardcoded secret).
-    """
-    title = (finding.title or "").lower()
-    body = " ".join(
-        [finding.description or "", finding.rule_id or "", " ".join(finding.references or [])]
-    ).lower()
-
-    def score(topic: Topic, text: str) -> int:
-        return sum(1 for pattern in topic.patterns if pattern in text)
-
-    # The title is a precise label, so a title match always wins. Only when no
-    # title matches do we look at the description (which mentions many words).
-    titled = [t for t in TOPICS if score(t, title) > 0]
-    if titled:
-        return max(titled, key=lambda t: score(t, title))
-
-    descored = [t for t in TOPICS if score(t, body) > 0]
-    if descored:
-        return max(descored, key=lambda t: score(t, body))
-
-    return DEFAULT_TOPIC
-
-
-# ---------------------------------------------------------------------------
-# Ordering / de-duplication
-# ---------------------------------------------------------------------------
-
-def sort_findings(findings: list[NormalizedFinding]) -> list[NormalizedFinding]:
-    """Worst first: severity, then CVSS score, then title for stable output."""
-    return sorted(
-        findings,
-        key=lambda f: (severity_rank(f.severity), -(f.cvss or 0.0), f.title.lower()),
-    )
-
-
-def dedupe_findings(findings: list[NormalizedFinding]) -> list[NormalizedFinding]:
-    """
-    Merge overlaps between engines. Two findings are the same issue when they share
-    a normalised title and location; the first (worst, thanks to the sort) wins.
-    """
-    seen: dict[tuple[str, str], NormalizedFinding] = {}
-    ordered = sort_findings(findings)
-    for finding in ordered:
-        key = (
-            " ".join(finding.title.lower().split()),
-            " ".join(finding.location.lower().split()),
-        )
-        existing = seen.get(key)
-        if existing is None:
-            seen[key] = finding
-            continue
-        # keep the worse severity / richer evidence
-        if severity_rank(finding.severity) < severity_rank(existing.severity):
-            seen[key] = finding
-        elif len(finding.evidence or "") > len(existing.evidence or ""):
-            seen[key] = finding
-    return sort_findings(list(seen.values()))
-
-
-# ---------------------------------------------------------------------------
-# Finding -> report entry
-# ---------------------------------------------------------------------------
-
-def build_finding(finding: NormalizedFinding, priority: int) -> LLMFinding:
-    topic = _find_topic(finding)
-
-    # A scanner's own description is usually specific to this exact target, so
-    # prefer it once it carries enough detail; otherwise fall back to the
-    # knowledge base, which is written for a general audience.
-    description = (finding.description or "").strip()
-    if len(description) >= 120:
-        explanation = description
-    else:
-        explanation = topic.summary or description or DEFAULT_TOPIC.summary
-
-    references = list(dict.fromkeys(finding.references or []))
-    if finding.cve:
-        nvd = f"https://nvd.nist.gov/vuln/detail/{finding.cve}"
-        if nvd not in references:
-            references.insert(0, nvd)
-
-    return LLMFinding(
-        title=finding.title,
-        severity=finding.severity,
-        explanation=explanation,
-        impact=topic.impact,
-        suggested_fix=topic.fix,
-        references=references,
-        location=finding.location or "Not applicable",
-        evidence=finding.evidence or "",
-        source_scanner=finding.source_scanner,
-        cve=finding.cve,
-        cvss=finding.cvss,
-        owasp=topic.owasp,
-        cwe=CWE_BY_TOPIC.get(topic.name, ""),
-        mitre=MITRE_BY_TOPIC.get(topic.name, ""),
-        # Findings re-checked by the verify agent carry higher confidence than a
-        # single engine's word; hand-written inferences are marked low.
-        confidence=(
-            "high" if "verify re-check" in (finding.evidence or "")
-            else "medium" if finding.source_scanner
-            else "low"
-        ),
-        verified="verify re-check" in (finding.evidence or ""),
-        priority=priority,
-    )
-
-
-def compute_risk_score(findings: list[LLMFinding]) -> int:
-    """Weighted 0-100 engagement risk score.
-
-    Critical/high findings dominate, and a confirmed (re-verified) finding is
-    worth more than an unverified one. The score saturates rather than exploding,
-    so 20 informational findings never outweigh one confirmed critical.
-    """
-    weights = {
-        Severity.CRITICAL: 40.0,
-        Severity.HIGH: 18.0,
-        Severity.MEDIUM: 6.0,
-        Severity.LOW: 1.5,
-        Severity.INFO: 0.4,
-    }
-    raw = 0.0
-    for f in findings:
-        multiplier = 1.25 if f.verified else 1.0
-        raw += weights.get(f.severity, 0.0) * multiplier
-    # Soft saturation: 100 * raw / (raw + 55) approaches 100 asymptotically.
-    return int(round(100 * raw / (raw + 55))) if raw else 0
-
-
-def _risk_rating(findings: list[LLMFinding]) -> str:
-    if not findings:
-        return "informational"
-    worst = min((f.severity for f in findings), key=severity_rank)
-    return SEVERITY_TITLE[worst].lower()
-
-
-def _counts(findings: list[LLMFinding]) -> dict[Severity, int]:
-    counts = {s: 0 for s in Severity}
-    for f in findings:
-        counts[f.severity] += 1
-    return counts
-
-
-def _executive_summary(target: str, scan_type: ScanType, findings: list[LLMFinding]) -> str:
-    counts = _counts(findings)
-    scope = "the live web application" if scan_type == ScanType.URL else "the submitted source code"
-    total = len(findings)
-
-    if total == 0:
-        return (
-            f"The automated assessment of {scope} (`{target}`) completed without "
-            "producing any findings.\n\n"
-            "This does not mean the target is secure. Automated checks only cover "
-            "what they know how to look for, and this run only reflects the engines "
-            "that were available at the time. Treat the result as 'no issues detected "
-            "by these checks', not as a clean bill of health."
-        )
-
-    worst = min((f.severity for f in findings), key=severity_rank)
-    counts_line = ", ".join(
-        f"{counts[s]} {SEVERITY_TITLE[s].lower()}"
-        for s in Severity
-        if counts[s]
-    )
-
-    paragraphs = [
-        f"The automated assessment of {scope} (`{target}`) produced **{total} "
-        f"finding{'s' if total != 1 else ''}** ({counts_line}). The highest severity "
-        f"observed is **{SEVERITY_TITLE[worst]}**, so the overall risk for this "
-        f"target is rated **{_risk_rating(findings)}**."
-    ]
-
-    top = [
-        f for f in findings if f.severity in (Severity.CRITICAL, Severity.HIGH)
-    ][:3]
-    if top:
-        bullets = "\n".join(
-            f"- **{SEVERITY_TITLE[f.severity]} — {f.title}**"
-            + (f" (`{f.location}`)" if f.location and f.location != "Not applicable" else "")
-            for f in top
-        )
-        paragraphs.append(
-            "Address these first — each one is either directly exploitable or removes "
-            "a layer of defence that makes the others worse:\n\n" + bullets
-        )
-    elif counts[Severity.MEDIUM]:
-        paragraphs.append(
-            "No critical or high severity issues were found. The medium severity "
-            "findings below are configuration and hardening gaps that make other "
-            "attacks easier; they are worth scheduling rather than ignoring."
-        )
-    else:
-        paragraphs.append(
-            "Only low and informational findings were produced. That is a good "
-            "result, but it reflects the depth of these automated checks, not a "
-            "guarantee that the application is free of exploitable flaws."
-        )
-
-    if counts[Severity.CRITICAL] or counts[Severity.HIGH]:
-        paragraphs.append(
-            f"Remediation order: {SEVERITY_SLA[Severity.CRITICAL]} for anything "
-            "critical, then high severity within a week. Fixing one critical issue "
-            "reduces risk far more than fixing ten informational ones."
-        )
-
-    return "\n\n".join(paragraphs)
-
-
-# ---------------------------------------------------------------------------
-# Optional LLM enrichment
-# ---------------------------------------------------------------------------
-
-async def _enrich_with_llm(findings: list[LLMFinding], target: str) -> list[LLMFinding]:
-    if not settings.LLM_API_KEY or not findings:
-        return findings
-
+def _build_anthropic_client() -> Any:
     try:
         import anthropic
-
-        client = anthropic.AsyncAnthropic(api_key=settings.LLM_API_KEY)
-
-        payload = [
-            {
-                "index": i,
-                "title": f.title,
-                "severity": f.severity.value,
-                "scanner": str(f.source_scanner),
-                "location": f.location,
-                "evidence": f.evidence[:400],
-                "description": f.explanation[:600],
-            }
-            for i, f in enumerate(findings[:15])
-        ]
-
-        prompt = (
-            "You are a senior application security engineer writing one section of a "
-            "penetration-test report for a learning exercise.\n"
-            f"Target: {target}\n"
-            "For each finding, rewrite three fields in clear, professional English for "
-            "a developer who is not a security specialist:\n"
-            "  explanation: what the issue is and why it exists (2-4 sentences)\n"
-            "  impact: what an attacker could actually do (2-3 sentences)\n"
-            "  suggested_fix: concrete remediation steps (2-4 numbered steps)\n"
-            "Do not invent CVEs, versions or evidence that are not in the input. Keep "
-            "each field plain text, no markdown headers.\n"
-            "Return ONLY a JSON array of objects with keys: index, explanation, "
-            "impact, suggested_fix.\n\n"
-            f"Findings:\n{json.dumps(payload, indent=2)}"
+    except ImportError as exc:
+        raise RuntimeError(
+            "LLM_PROVIDER is set to 'anthropic' but the 'anthropic' package is not installed."
+        ) from exc
+    api_key = os.getenv("LLM_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "LLM_API_KEY is empty; configure it in .env or the Vercel env UI before using the Anthropic provider."
         )
+    return anthropic.Anthropic(api_key=api_key)
 
-        message = await client.messages.create(
-            model=settings.LLM_MODEL,
-            max_tokens=4000,
-            messages=[{"role": "user", "content": prompt}],
+
+def _build_openai_client() -> Any:
+    try:
+        import openai
+    except ImportError as exc:
+        raise RuntimeError(
+            "LLM_PROVIDER is set to 'openai' but the 'openai' package is not installed."
+        ) from exc
+    api_key = os.getenv("LLM_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "LLM_API_KEY is empty; configure it in .env or the Vercel env UI before using the OpenAI provider."
         )
-        text = "".join(
-            block.text for block in message.content if getattr(block, "type", "") == "text"
-        )
-        start, end = text.find("["), text.rfind("]")
-        if start == -1 or end == -1:
-            raise ValueError("LLM response contained no JSON array")
-
-        for item in json.loads(text[start : end + 1]):
-            idx = item.get("index")
-            if not isinstance(idx, int) or not (0 <= idx < len(findings)):
-                continue
-            if item.get("explanation"):
-                findings[idx].explanation = str(item["explanation"]).strip()
-            if item.get("impact"):
-                findings[idx].impact = str(item["impact"]).strip()
-            if item.get("suggested_fix"):
-                findings[idx].suggested_fix = str(item["suggested_fix"]).strip()
-
-        print(f"[llm] enriched {min(len(findings), 15)} finding(s) with {settings.LLM_MODEL}")
-    except Exception as exc:  # noqa: BLE001 - enrichment is strictly optional
-        print(f"[llm] enrichment skipped ({type(exc).__name__}: {exc}); using built-in prose")
-
-    return findings
+    return openai.OpenAI(api_key=api_key)
 
 
-# ---------------------------------------------------------------------------
-# Markdown export
-# ---------------------------------------------------------------------------
+def get_client() -> Any:
+    provider = os.getenv("LLM_PROVIDER", "none").lower()
+    if provider == "anthropic":
+        return _build_anthropic_client()
+    if provider == "openai":
+        return _build_openai_client()
+    return None
 
-def build_markdown(report: ScanReport) -> str:
-    counts = report.findings_by_severity
-    lines = [
-        f"# Security Assessment Report — {report.target}",
-        "",
-        f"- **Scan ID:** `{report.scan_id}`",
-        f"- **Date:** {report.timestamp.strftime('%Y-%m-%d %H:%M')}",
-        f"- **Target:** `{report.target}`",
-        f"- **Scope:** {report.scan_type.value}",
-        f"- **Overall risk:** {report.risk_rating.upper()} (score {report.risk_score}/100)",
-        f"- **Total findings:** {report.total_findings}",
-        "",
-    ]
 
-    if report.engagement:
-        e = report.engagement
-        lines += [
-            "## Engagement",
-            "",
-            f"- **Test type:** {e.test_type}",
-            f"- **Started:** {e.started_at.strftime('%Y-%m-%d %H:%M:%S')}",
-            f"- **Completed:** {e.completed_at.strftime('%Y-%m-%d %H:%M:%S')}",
-            f"- **Duration:** {int(e.duration_seconds)}s",
-            f"- **Authorization:** {e.authorization}",
-            f"- **Scope:** {e.scope_note}",
-            "",
-        ]
-        if e.tools_run:
-            lines += ["**Tools executed**", ""] + [f"- {t}" for t in e.tools_run] + [""]
+def provider_is_available() -> bool:
+    return get_client() is not None
 
-    lines += [
-        "## Findings by severity",
-        "",
-        "| Severity | Count |",
-        "| --- | --- |",
-    ]
-    for sev in Severity:
-        lines.append(f"| {SEVERITY_TITLE[sev]} | {counts.get(sev, 0)} |")
 
-    lines += ["", "## Executive summary", "", report.summary, ""]
+# =============================================================================
+# Deterministic / knowledge-base report — no LLM required.
+# =============================================================================
 
-    if report.methodology:
-        lines += ["## Methodology", ""]
-        lines += [f"- {m}" for m in report.methodology]
+
+def generate_report(
+    findings: list[NormalizedFinding],
+    target: TargetInfo,
+    config: dict[str, Any],
+    engine: str = "deterministic",
+) -> dict[str, Any]:
+    """Build a report dict without calling any LLM provider.
+
+    Parameters
+    ----------
+    findings:
+        Normalized findings from the scanner normalizer.
+    target:
+        Target metadata attached to the scan.
+    config:
+        Provider/model config dict; ignored by the deterministic path except
+        for logging purposes.
+    engine:
+        Which engine produced the findings; used only for the report summary.
+    """
+    total = len(findings)
+    start_time = time.time()
+
+    logger.info(
+        "generate_report(deterministic) target=%s findings=%d",
+        target.host,
+        total,
+    )
+
+    report = {
+        "target": target.model_dump(),
+        "generated_at": datetime.utcnow().isoformat(),
+        "total_findings": total,
+        "findings": [f.model_dump() for f in findings],
+        "provider": "deterministic",
+        "engine": engine,
+    }
+
+    logger.info(
+        "generate_report(deterministic) completed target=%s duration_ms=%.0f",
+        target.host,
+        (time.time() - start_time) * 1000.0,
+    )
+    return report
+
+
+def _parse_tool_call(text: str) -> Optional[ToolCall]:
+    """Extract a single tool call from a provider message if present."""
+    if not text:
+        return None
+    m = re.search(r"<tool_call>(.*?)</tool_call>", text, re.DOTALL)
+    if not m:
+        return None
+    try:
+        payload = json.loads(m.group(1))
+    except json.JSONDecodeError:
+        return None
+    return ToolCall.model_validate(payload)
+
+
+# =============================================================================
+# LLM-backed opinionated report (optional, provider-gated).
+# =============================================================================
+
+
+def build_markdown(report: EngagementReport) -> str:
+    """Render an engagement/scan report as Markdown.
+
+    This path is provider-agnostic and uses only the data already present in
+    the report object, so it works whether or not an LLM provider is enabled.
+    """
+    lines: list[str] = []
+    target = report.target
+    lines.append(f"# Security Review — {target.host}")
+    lines.append("")
+    lines.append(f"- **Target:** {target.url or target.host}")
+    lines.append(f"- **Generated:** {report.generated_at}")
+    lines.append(f"- **Provider:** {report.provider}")
+    lines.append(f"- **Engine:** {report.engine}")
+    lines.append(f"- **Total findings:** {report.total_findings}")
+    lines.append("")
+
+    if report.summary:
+        lines.append("## Executive Summary")
+        lines.append("")
+        lines.append(report.summary)
         lines.append("")
 
-    if report.engines:
-        lines += ["## Engine availability", "", "| Engine | Role | Status |", "| --- | --- | --- |"]
-        for e in report.engines:
-            status = f"available ({e.version})" if e.available else "not available"
-            lines.append(f"| {e.label} | {e.role.value} | {status} |")
+    if report.finding_count:
+        lines.append("## Findings by severity")
+        lines.append("")
+        for severity, count in report.finding_count.items():
+            lines.append(f"- {severity.value}: {count}")
         lines.append("")
 
-    lines += ["## Detailed findings", ""]
-    if not report.findings:
-        lines.append("_No findings were reported by the engines that ran._")
-
-    for i, f in enumerate(report.findings, start=1):
-        lines += [
-            f"### {i}. [{SEVERITY_TITLE[f.severity]}] {f.title}",
-            "",
-            f"- **Priority:** P{f.priority}",
-            f"- **Location:** `{f.location}`",
-            f"- **Detected by:** {f.source_scanner.value if f.source_scanner else 'n/a'}",
-        ]
-        if f.cve:
-            lines.append(f"- **CVE:** {f.cve}")
-        if f.cvss:
-            lines.append(f"- **CVSS:** {f.cvss}")
-        if f.owasp:
-            lines.append(f"- **OWASP:** {f.owasp}")
-        if f.cwe:
-            lines.append(f"- **CWE:** {f.cwe}")
-        if f.mitre:
-            lines.append(f"- **MITRE ATT&CK:** {f.mitre}")
-        lines.append(
-            f"- **Confidence:** {f.confidence}" + (" (re-verified)" if f.verified else "")
-        )
+    if report.findings:
+        lines.append("## Findings")
         lines.append("")
-        if f.evidence:
-            lines += ["**Evidence**", "", "```", f.evidence, "```", ""]
-        lines += [
-            "**What this is**",
-            "",
-            f.explanation,
-            "",
-            "**Impact**",
-            "",
-            f.impact,
-            "",
-            "**How to fix it**",
-            "",
-            f.suggested_fix,
-            "",
-        ]
-        if f.references:
-            lines.append("**References**")
+        for finding in report.findings:
+            sev = finding.severity or Severity.INFO
+            lines.append(f"### {sev.value} — {finding.title or 'Unnamed finding'}")
             lines.append("")
-            lines += [f"- {r}" for r in f.references]
+            if finding.description:
+                lines.append(finding.description)
+                lines.append("")
+            if finding.remediation:
+                lines.append("**Remediation**")
+                lines.append("")
+                lines.append(finding.remediation)
+                lines.append("")
+            if finding.location:
+                lines.append(f"- **Location:** {finding.location}")
+            lines.append("---")
             lines.append("")
 
-    lines += ["---", "", report.disclaimer, ""]
+    if report.tool_calls:
+        lines.append("## Tool calls")
+        lines.append("")
+        for tc in report.tool_calls:
+            lines.append(f"- **{tc.tool}:** {tc.arguments}")
+        lines.append("")
+
+    lines.append("## Metadata")
+    lines.append("")
+    lines.append(f"- **Report ID:** {report.id}")
+    lines.append(f"- **Engagement ID:** {report.engagement_id or 'n/a'}")
+    lines.append(f"- **Scan ID:** {report.scan_id or 'n/a'}")
+    lines.append("")
     return "\n".join(lines)
 
 
-# ---------------------------------------------------------------------------
-# HTML export — client-deliverable, print-ready report
-# ---------------------------------------------------------------------------
+def build_html(report: EngagementReport) -> str:
+    """Render an engagement/scan report as a standalone HTML page.
 
-SEV_COLOR = {
-    Severity.CRITICAL: "#dc2626",
-    Severity.HIGH: "#ea580c",
-    Severity.MEDIUM: "#ca8a04",
-    Severity.LOW: "#2563eb",
-    Severity.INFO: "#64748b",
-}
+    Provider-agnostic; uses only the data in the report object so it works
+    with or without an LLM provider enabled.
+    """
+    findings_html = ""
+    if report.findings:
+        items: list[str] = []
+        for f in report.findings:
+            sev = f.severity or Severity.INFO
+            title = (f.title or "Unnamed finding").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            desc = (f.description or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            rem = (f.remediation or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            loc = (f.location or "")
+            items.append(
+                f'<div class="finding finding-{sev.value.lower()}">'
+                f'<div class="finding-head"><span class="finding-sev">{sev.value}</span> '
+                f'<strong class="finding-title">{title}</strong>'
+                + (f'<span class="finding-loc">{loc}</span>' if loc else "")
+                + "</div>"
+                + (f'<div class="finding-desc">{desc}</div>' if desc else "")
+                + (f'<div class="finding-rem"><strong>Remediation:</strong> {rem}</div>' if rem else "")
+                + "</div>"
+            )
+        findings_html = "\n".join(items)
 
-
-def _esc(value: str) -> str:
-    from html import escape
-
-    return escape(str(value or ""), quote=True)
-
-
-def build_html(report: ScanReport) -> str:
-    """Standalone HTML report: cover, risk score, engagement metadata, findings."""
-    counts = report.findings_by_severity
-    e = report.engagement
-
-    rows = "".join(
-        f'<tr><td style="color:{SEV_COLOR[s]};font-weight:700">{SEVERITY_TITLE[s]}</td>'
-        f"<td>{counts.get(s, 0)}</td></tr>"
-        for s in Severity
-    )
-
-    engagement_html = ""
-    if e:
-        tools = "".join(f"<li>{_esc(t)}</li>" for t in (e.tools_run or [])) or "<li>Built-in checks only</li>"
-        engagement_html = f"""
-        <section>
-          <h2>Engagement details</h2>
-          <table class="meta">
-            <tr><th>Test type</th><td>{_esc(e.test_type)}</td></tr>
-            <tr><th>Target</th><td><code>{_esc(e.target)}</code></td></tr>
-            <tr><th>Started</th><td>{e.started_at.strftime('%Y-%m-%d %H:%M:%S')}</td></tr>
-            <tr><th>Completed</th><td>{e.completed_at.strftime('%Y-%m-%d %H:%M:%S')}</td></tr>
-            <tr><th>Duration</th><td>{int(e.duration_seconds)} seconds</td></tr>
-            <tr><th>Authorization</th><td>{_esc(e.authorization)}</td></tr>
-            <tr><th>Scope</th><td>{_esc(e.scope_note)}</td></tr>
-          </table>
-          <h3>Tools executed</h3><ul>{tools}</ul>
-        </section>"""
-
-    findings_html = []
-    for i, f in enumerate(report.findings, start=1):
-        refs = "".join(
-            f'<li><a href="{_esc(r)}">{_esc(r)}</a></li>' for r in f.references
+    tool_calls_html = ""
+    if report.tool_calls:
+        rows = "".join(
+            f'<tr><td class="tc-tool">{tc.tool}</td><td class="tc-args">{json.dumps(tc.arguments)}</td></tr>'
+            for tc in report.tool_calls
         )
-        meta = []
-        if f.cwe:
-            meta.append(f"<span class='tag'>CWE {_esc(f.cwe.removeprefix('CWE-'))}</span>")
-        if f.cve:
-            meta.append(f"<span class='tag'>{_esc(f.cve)}</span>")
-        if f.cvss:
-            meta.append(f"<span class='tag'>CVSS {f.cvss}</span>")
-        if f.owasp:
-            meta.append(f"<span class='tag'>{_esc(f.owasp)}</span>")
-        if f.mitre:
-            meta.append(f"<span class='tag'>{_esc(f.mitre)}</span>")
-        meta.append(f"<span class='tag'>confidence: {_esc(f.confidence)}</span>")
-        findings_html.append(f"""
-        <article class="finding" style="border-left-color:{SEV_COLOR[f.severity]}">
-          <header>
-            <span class="sev" style="background:{SEV_COLOR[f.severity]}">{SEVERITY_TITLE[f.severity].upper()}</span>
-            <h2>{i}. {_esc(f.title)}</h2>
-          </header>
-          <p class="tags">{' '.join(meta)}</p>
-          <table class="meta">
-            <tr><th>Priority</th><td>P{f.priority}</td></tr>
-            <tr><th>Location</th><td><code>{_esc(f.location)}</code></td></tr>
-            <tr><th>Detected by</th><td>{_esc(f.source_scanner.value if f.source_scanner else 'n/a')}</td></tr>
-          </table>
-          {'<h3>Evidence</h3><pre>' + _esc(f.evidence) + '</pre>' if f.evidence else ''}
-          <h3>What this is</h3><p>{_esc(f.explanation)}</p>
-          <h3>Impact</h3><p>{_esc(f.impact)}</p>
-          <h3>Remediation</h3><p class="fix">{_esc(f.suggested_fix)}</p>
-          {'<h3>References</h3><ul>' + refs + '</ul>' if refs else ''}
-        </article>""")
+        tool_calls_html = f'<table class="tc-table"><thead><tr><th>Tool</th><th>Arguments</th></tr></thead><tbody>{rows}</tbody></table>'
 
-    if not report.findings:
-        findings_html.append("<p><em>No findings were reported by the engines that ran.</em></p>")
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Security Review — {report.target.host}</title>
+  <style>
+    :root {{
+      --bg: #0b0d10;
+      --panel: #111318;
+      --line: #1c212a;
+      --fg: #e9edf3;
+      --muted: #8a93a1;
+      --danger: #f8a8a8;
+      --high: #f4c97a;
+      --med: #b4c7e7;
+      --low: #8a93a1;
+      --info: #7e9cd4;
+    }}
+    * {{ box-sizing: border-box; }}
+    html, body {{ margin: 0; padding: 0; background: var(--bg); color: var(--fg); font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace; }}
+    .wrap {{ max-width: 920px; margin: 0 auto; padding: 2rem 1.5rem; }}
+    header {{ border-bottom: 1px solid var(--line); padding-bottom: 1rem; margin-bottom: 1.5rem; display: flex; justify-content: space-between; align-items: flex-end; }}
+    h1 {{ margin: 0; font-size: 1.6rem; letter-spacing: 0.02em; }}
+    .meta {{ color: var(--muted); font-size: 0.8rem; text-align: right; line-height: 1.5; }}
+    .meta strong {{ color: var(--fg); }}
+    h2 {{ margin: 2rem 0 0.6rem; font-size: 1rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); border-bottom: 1px solid var(--line); padding-bottom: 0.3rem; }}
+    .sev {{ display: inline-block; padding: 0.1rem 0.5rem; border-radius: 4px; font-size: 0.7rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; }}
+    .sev.critical {{ background: rgba(248,168,168,0.18); color: var(--danger); }}
+    .sev.high {{ background: rgba(244,201,122,0.16); color: var(--high); }}
+    .sev.medium {{ background: rgba(180,199,231,0.14); color: var(--med); }}
+    .sev.low {{ background: rgba(138,147,161,0.16); color: var(--low); }}
+    .sev.info {{ background: rgba(126,156,212,0.16); color: var(--info); }}
+    .finding {{ background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 1rem 1.1rem; margin-bottom: 0.9rem; }}
+    .finding-head {{ display: flex; align-items: baseline; gap: 0.6rem; flex-wrap: wrap; }}
+    .finding-sev {{ font-size: 0.65rem; padding: 0.1rem 0.4rem; border-radius: 4px; }}
+    .finding-title {{ font-size: 1rem; }}
+    .finding-loc {{ margin-left: auto; color: var(--muted); font-size: 0.75rem; }}
+    .finding-desc {{ color: var(--fg); margin-top: 0.5rem; line-height: 1.5; }}
+    .finding-rem {{ color: var(--high); margin-top: 0.5rem; }}
+    .tc-table {{ width: 100%; border-collapse: collapse; margin-top: 0.5rem; font-size: 0.8rem; }}
+    .tc-table th, .tc-table td {{ text-align: left; padding: 0.4rem 0.6rem; border-bottom: 1px solid var(--line); }}
+    .tc-table th {{ color: var(--muted); text-transform: uppercase; font-size: 0.7rem; letter-spacing: 0.05em; }}
+    .tc-tool {{ font-weight: 600; }}
+    .tc-args {{ color: var(--muted); font-family: ui-monospace, monospace; word-break: break-word; }}
+    .footer {{ margin-top: 3rem; border-top: 1px solid var(--line); padding-top: 1rem; color: var(--muted); font-size: 0.75rem; }}
+    .empty {{ color: var(--muted); font-style: italic; padding: 1rem 0; }}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <div>
+        <h1>Security Review — {report.target.host}</h1>
+        <div class="meta">
+          <strong>Target:</strong> {report.target.url or report.target.host}<br />
+          <strong>Generated:</strong> {report.generated_at}<br />
+          <strong>Provider:</strong> {report.provider}<br />
+          <strong>Engine:</strong> {report.engine}<br />
+          <strong>Total findings:</strong> {report.total_findings}
+        </div>
+      </div>
+    </header>
 
-    return f"""<!doctype html><html><head><meta charset="utf-8">
-<title>Security Assessment — {_esc(report.target)}</title>
-<style>
-  body{{font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:#0f172a;max-width:920px;margin:0 auto;padding:40px 28px;line-height:1.55;background:#fff}}
-  h1{{font-size:26px;margin:0 0 4px}} h2{{font-size:17px;margin:26px 0 8px}} h3{{font-size:14px;margin:16px 0 6px;color:#334155;text-transform:uppercase;letter-spacing:.04em}}
-  .cover{{border-bottom:3px solid #0f172a;padding-bottom:18px;margin-bottom:24px}}
-  .badge{{display:inline-block;padding:4px 10px;border-radius:6px;color:#fff;font-weight:700;font-size:12px;letter-spacing:.04em}}
-  .score{{display:flex;gap:24px;align-items:center;margin:18px 0}}
-  .gauge{{width:92px;height:92px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:24px;font-weight:800;color:#fff}}
-  table{{border-collapse:collapse;width:100%;font-size:13.5px;margin:8px 0}}
-  th,td{{text-align:left;padding:6px 10px;border-bottom:1px solid #e2e8f0;vertical-align:top}}
-  table.meta th{{width:190px;color:#475569;font-weight:600}}
-  .finding{{border:1px solid #e2e8f0;border-left:5px solid #999;border-radius:8px;padding:16px 18px;margin:18px 0;page-break-inside:avoid}}
-  .finding h2{{margin:10px 0 0;font-size:16px}} .finding header{{display:flex;gap:10px;align-items:center}}
-  .sev{{color:#fff;font-size:10.5px;font-weight:800;padding:3px 8px;border-radius:4px;letter-spacing:.05em}}
-  .tag{{display:inline-block;background:#f1f5f9;border:1px solid #e2e8f0;border-radius:4px;padding:2px 7px;font-size:11.5px;margin-right:6px;color:#334155}}
-  pre{{background:#0f172a;color:#e2e8f0;padding:12px;border-radius:6px;overflow-x:auto;font-size:12px;white-space:pre-wrap}}
-  .fix{{white-space:pre-line}} .disclaimer{{margin-top:36px;border-top:1px solid #e2e8f0;padding-top:14px;font-size:11.5px;color:#64748b}}
-  a{{color:#1d4ed8}} @media print{{body{{padding:0}} .finding{{page-break-inside:avoid}}}}
-</style></head><body>
-<header class="cover">
-  <div style="display:flex;justify-content:space-between;align-items:baseline">
-    <h1>Security Assessment Report</h1>
-    <span class="badge" style="background:{SEV_COLOR.get(min((f.severity for f in report.findings), key=severity_rank, default=Severity.INFO), '#64748b')}">{report.risk_rating.upper()}</span>
+    {"<h2>Executive Summary</h2>" + report.summary.replace("\n", "<br />") if report.summary else '<div class="empty">No executive summary available.</div>'}
+
+    {"<h2>Findings by severity</h2>" + "".join(f"<div><span class='sev sev-{sev.value.lower()}'>{sev.value}</span> <strong>{count}</strong></div>" for sev, count in report.finding_count.items()) if report.finding_count else '<div class="empty">No findings recorded.</div>'}
+
+    {"<h2>Findings</h2>" + findings_html if findings_html else '<div class="empty">No findings recorded.</div>'}
+
+    {"<h2>Tool calls</h2>" + tool_calls_html if tool_calls_html else ''}
+
+    <div class="footer">
+      <strong>Report ID:</strong> {report.id}<br />
+      <strong>Engagement ID:</strong> {report.engagement_id or 'n/a'}<br />
+      <strong>Scan ID:</strong> {report.scan_id or 'n/a'}
+    </div>
   </div>
-  <p style="margin:4px 0;color:#475569">{_esc(report.target)} · scan <code>{_esc(report.scan_id)}</code> · {report.timestamp.strftime('%Y-%m-%d %H:%M')}</p>
-  <div class="score">
-    <div class="gauge" style="background:{SEV_COLOR.get(min((f.severity for f in report.findings), key=severity_rank, default=Severity.INFO), '#64748b')}">{report.risk_score}</div>
-    <div><strong>Risk score {report.risk_score}/100</strong><br><span style="color:#475569">{report.total_findings} findings across {sum(1 for s in Severity if counts.get(s))} severity band(s)</span></div>
-  </div>
-  <table>{rows}</table>
-</header>
-{engagement_html}
-<section><h2>Executive summary</h2><p style="white-space:pre-line">{_esc(report.summary)}</p></section>
-{'<section><h2>Methodology</h2><ul>' + ''.join(f'<li>{_esc(m)}</li>' for m in report.methodology) + '</ul></section>' if report.methodology else ''}
-<section><h2>Detailed findings</h2>{''.join(findings_html)}</section>
-<p class="disclaimer">{_esc(report.disclaimer)}</p>
-</body></html>"""
+</body>
+</html>"""
 
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
-
-async def generate_report(
-    scan_id: str,
-    target: str,
-    scan_type: ScanType,
+def generate_report_opinionated(
     findings: list[NormalizedFinding],
-    engines: Optional[list] = None,
-    methodology: Optional[list[str]] = None,
-    engagement: Optional[dict] = None,
-) -> ScanReport:
-    """Build a severity-ordered, human-readable report from normalized findings."""
-    from app.services.scanner import engines_used  # local import avoids a cycle
+    target: TargetInfo,
+    config: dict[str, Any],
+    scanner_engine: str = "scanner",
+    client: Optional[Any] = None,
+) -> EngagementReport:
+    raise NotImplementedError('stub')
 
-    ordered = dedupe_findings(findings or [])
-    built = [build_finding(f, priority=min(severity_rank(f.severity) + 1, 5)) for f in ordered]
-    built = await _enrich_with_llm(built, target)
 
-    counts = _counts(built)
-    methodology = list(methodology) if methodology is not None else engines_used(ordered)
+def _to_engagement_report(raw: dict[str, Any], target: TargetInfo) -> EngagementReport:
+    raise NotImplementedError('stub')
 
-    report = ScanReport(
-        scan_id=scan_id,
-        timestamp=datetime.now(),
-        target=target,
-        scan_type=scan_type,
-        summary=_executive_summary(target, scan_type, built),
-        total_findings=len(built),
-        findings_by_severity=counts,
-        findings=built,
-        risk_score=compute_risk_score(built),
-        risk_rating=_risk_rating(built),
-        methodology=methodology,
-        engines=engines or [],
-        engagement=engagement,
+
+def _call_llm_for_summary(client: Any, findings: list[NormalizedFinding], target: TargetInfo, config: dict[str, Any]) -> Optional[str]:
+    """Ask the LLM provider for a short executive summary.
+
+    Returns ``None`` when the provider did not return usable text.
+    """
+    payload = _build_summary_prompt(findings, target)
+    try:
+        if hasattr(client, "messages"):
+            resp = client.messages.create(
+                model=os.getenv("LLM_MODEL", "claude-3-haiku-20240307"),
+                max_tokens=1024,
+                messages=[{"role": "user", "content": payload}],
+            )
+            if resp.content:
+                return resp.content[0].text or None
+            return None
+        if hasattr(client, "chat"):
+            resp = client.chat.completions.create(
+                model=os.getenv("LLM_MODEL", "gpt-4o"),
+                max_tokens=1024,
+                messages=[{"role": "user", "content": payload}],
+            )
+            if resp.choices:
+                return resp.choices[0].message.content or None
+            return None
+        return None
+    except Exception as exc:
+        logger.exception("generate_report_opinionated: LLM call failed: %s", exc)
+        return None
+
+
+def _build_summary_prompt(findings: list[NormalizedFinding], target: TargetInfo) -> str:
+    finding_lines = []
+    for f in findings:
+        sev = f.severity.value if f.severity else "info"
+        loc = f" at {f.location}" if f.location else ""
+        finding_lines.append(f"- [{sev}] {f.title or 'Unnamed'}{loc}")
+    body = "\n".join(finding_lines) if finding_lines else "No findings."
+    return (
+        "You are a senior application security analyst producing a concise executive summary.\n"
+        "Target: " + (target.url or target.host) + "\n"
+        "Findings:\n" + body + "\n\n"
+        "Write a short executive summary (3-6 sentences). Include:\n"
+        "- overall risk posture and the most important issue(s)\n"
+        "- likely impact if exploited\n"
+        "- recommended remediation priorities\n"
+        "Do not repeat the finding list verbatim."
     )
-    return report
+
+
+def _fallback_summary(findings: list[Finding], target: TargetInfo) -> str:
+    high = [f for f in findings if f.severity and f.severity.value in {"CRITICAL", "HIGH"}]
+    if high:
+        titles = "; ".join(f"{f.severity.value}: {f.title or 'Unnamed'}" for f in high[:5])
+        return (
+            f"Target {target.host} has {len(findings)} findings. "
+            f"Highest severity issues: {titles}. "
+            "Manual verification is required before acting on any finding."
+        )
+    if findings:
+        return (
+            f"Target {target.host} has {len(findings)} findings. "
+            "No critical or high severity issues were detected by the automated scan, "
+            "but results still require manual review."
+        )
+    return f"No automated findings were recorded for {target.host}."
+
+
+def _count_by_severity(findings: list[NormalizedFinding]) -> dict[Severity, int]:
+    counts: dict[Severity, int] = {}
+    for f in findings:
+        sev = f.severity or Severity.INFO
+        counts[sev] = counts.get(sev, 0) + 1
+    return counts
+
+
+def _count_by_severity_from_findings(findings: list[Finding]) -> dict[Severity, int]:
+    return _count_by_severity(findings)
+
+
+def _report_id() -> str:
+    now = int(time.time())
+    h = hashlib.sha256(f"report-{now}-{os.urandom(8).hex()}".encode()).hexdigest()[:12]
+    return f"rr-{now}-{h}"
+
+
+def format_finding_for_llm(finding: NormalizedFinding) -> str:
+    """Serialize a single normalized finding into a compact LLM-friendly string."""
+    sev = finding.severity.value if finding.severity else "info"
+    parts = [f"[{sev}] {finding.title or 'Unnamed finding'}"]
+    if finding.location:
+        parts.append(f"Location: {finding.location}")
+    if finding.description:
+        parts.append(finding.description)
+    if finding.remediation:
+        parts.append(f"Remediation: {finding.remediation}")
+    if finding.references:
+        parts.append("References: " + "; ".join(finding.references))
+    return "\n".join(parts)
