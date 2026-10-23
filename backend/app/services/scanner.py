@@ -21,6 +21,13 @@ Engines
 
 Nothing here re-implements exploits: external engines are invoked as CLIs and
 their structured output is parsed by `app.services.normalizer`.
+
+Deployment note
+---------------
+The server itself only needs the FastAPI runtime deps. Heavy scanner trees
+(semgrep, trivy, nuclei, nmap, nikto, ZAP, strix, ai-red-teaming) are
+optional and installed on the host that runs scans. The backend will still
+talk about those engines and run whichever ones are actually present.
 """
 
 from __future__ import annotations
