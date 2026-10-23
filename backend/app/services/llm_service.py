@@ -305,6 +305,53 @@ TOPICS: tuple[Topic, ...] = (
     ),
 )
 
+# CWE + MITRE ATT&CK mapping per knowledge-base topic. A real pentest report
+# carries these identifiers so a developer or auditor can trace each finding to
+# a standard weakness class and adversary technique.
+CWE_BY_TOPIC: dict[str, str] = {
+    "SQL injection": "CWE-89",
+    "Cross-site scripting": "CWE-79",
+    "Template injection": "CWE-1336",
+    "Hardcoded secrets": "CWE-798",
+    "Broken access control": "CWE-284",
+    "Missing security headers": "CWE-693",
+    "Cookie security": "CWE-614",
+    "CORS misconfiguration": "CWE-942",
+    "Exposed sensitive paths": "CWE-538",
+    "Security misconfiguration": "CWE-16",
+    "Vulnerable dependency": "CWE-1395",
+    "Outdated component": "CWE-1104",
+    "TLS / transport": "CWE-319",
+    "Open port / exposed service": "CWE-1327",
+    "Information disclosure": "CWE-200",
+    "Infrastructure as code": "CWE-1188",
+    "Remote code execution": "CWE-94",
+    "Unreachable": "",
+    "General security weakness": "CWE-20",
+}
+
+MITRE_BY_TOPIC: dict[str, str] = {
+    "SQL injection": "T1190 Exploit Public-Facing Application",
+    "Cross-site scripting": "T1059.007 JavaScript",
+    "Template injection": "T1059 Command and Scripting Interpreter",
+    "Hardcoded secrets": "T1552.001 Unsecured Credentials",
+    "Broken access control": "T1078 Valid Accounts",
+    "Missing security headers": "T1185 Browser Session Hijacking",
+    "Cookie security": "T1539 Steal Web Session Cookie",
+    "CORS misconfiguration": "T1190 Exploit Public-Facing Application",
+    "Exposed sensitive paths": "T1592 Gather Victim Host Information",
+    "Security misconfiguration": "T1190 Exploit Public-Facing Application",
+    "Vulnerable dependency": "T1195 Supply Chain Compromise",
+    "Outdated component": "T1195 Supply Chain Compromise",
+    "TLS / transport": "T1040 Network Sniffing",
+    "Open port / exposed service": "T1046 Network Service Discovery",
+    "Information disclosure": "T1592 Gather Victim Host Information",
+    "Infrastructure as code": "T1190 Exploit Public-Facing Application",
+    "Remote code execution": "T1203 Exploitation for Client Execution",
+    "Unreachable": "",
+    "General security weakness": "T1190 Exploit Public-Facing Application",
+}
+
 DEFAULT_TOPIC = Topic(
     "General security weakness",
     [],
@@ -419,8 +466,40 @@ def build_finding(finding: NormalizedFinding, priority: int) -> LLMFinding:
         cve=finding.cve,
         cvss=finding.cvss,
         owasp=topic.owasp,
+        cwe=CWE_BY_TOPIC.get(topic.name, ""),
+        mitre=MITRE_BY_TOPIC.get(topic.name, ""),
+        # Findings re-checked by the verify agent carry higher confidence than a
+        # single engine's word; hand-written inferences are marked low.
+        confidence=(
+            "high" if "verify re-check" in (finding.evidence or "")
+            else "medium" if finding.source_scanner
+            else "low"
+        ),
+        verified="verify re-check" in (finding.evidence or ""),
         priority=priority,
     )
+
+
+def compute_risk_score(findings: list[LLMFinding]) -> int:
+    """Weighted 0-100 engagement risk score.
+
+    Critical/high findings dominate, and a confirmed (re-verified) finding is
+    worth more than an unverified one. The score saturates rather than exploding,
+    so 20 informational findings never outweigh one confirmed critical.
+    """
+    weights = {
+        Severity.CRITICAL: 40.0,
+        Severity.HIGH: 18.0,
+        Severity.MEDIUM: 6.0,
+        Severity.LOW: 1.5,
+        Severity.INFO: 0.4,
+    }
+    raw = 0.0
+    for f in findings:
+        multiplier = 1.25 if f.verified else 1.0
+        raw += weights.get(f.severity, 0.0) * multiplier
+    # Soft saturation: 100 * raw / (raw + 55) approaches 100 asymptotically.
+    return int(round(100 * raw / (raw + 55))) if raw else 0
 
 
 def _risk_rating(findings: list[LLMFinding]) -> str:
@@ -587,9 +666,28 @@ def build_markdown(report: ScanReport) -> str:
         f"- **Date:** {report.timestamp.strftime('%Y-%m-%d %H:%M')}",
         f"- **Target:** `{report.target}`",
         f"- **Scope:** {report.scan_type.value}",
-        f"- **Overall risk:** {report.risk_rating.upper()}",
+        f"- **Overall risk:** {report.risk_rating.upper()} (score {report.risk_score}/100)",
         f"- **Total findings:** {report.total_findings}",
         "",
+    ]
+
+    if report.engagement:
+        e = report.engagement
+        lines += [
+            "## Engagement",
+            "",
+            f"- **Test type:** {e.test_type}",
+            f"- **Started:** {e.started_at.strftime('%Y-%m-%d %H:%M:%S')}",
+            f"- **Completed:** {e.completed_at.strftime('%Y-%m-%d %H:%M:%S')}",
+            f"- **Duration:** {int(e.duration_seconds)}s",
+            f"- **Authorization:** {e.authorization}",
+            f"- **Scope:** {e.scope_note}",
+            "",
+        ]
+        if e.tools_run:
+            lines += ["**Tools executed**", ""] + [f"- {t}" for t in e.tools_run] + [""]
+
+    lines += [
         "## Findings by severity",
         "",
         "| Severity | Count |",
@@ -630,6 +728,13 @@ def build_markdown(report: ScanReport) -> str:
             lines.append(f"- **CVSS:** {f.cvss}")
         if f.owasp:
             lines.append(f"- **OWASP:** {f.owasp}")
+        if f.cwe:
+            lines.append(f"- **CWE:** {f.cwe}")
+        if f.mitre:
+            lines.append(f"- **MITRE ATT&CK:** {f.mitre}")
+        lines.append(
+            f"- **Confidence:** {f.confidence}" + (" (re-verified)" if f.verified else "")
+        )
         lines.append("")
         if f.evidence:
             lines += ["**Evidence**", "", "```", f.evidence, "```", ""]
@@ -658,6 +763,133 @@ def build_markdown(report: ScanReport) -> str:
 
 
 # ---------------------------------------------------------------------------
+# HTML export — client-deliverable, print-ready report
+# ---------------------------------------------------------------------------
+
+SEV_COLOR = {
+    Severity.CRITICAL: "#dc2626",
+    Severity.HIGH: "#ea580c",
+    Severity.MEDIUM: "#ca8a04",
+    Severity.LOW: "#2563eb",
+    Severity.INFO: "#64748b",
+}
+
+
+def _esc(value: str) -> str:
+    from html import escape
+
+    return escape(str(value or ""), quote=True)
+
+
+def build_html(report: ScanReport) -> str:
+    """Standalone HTML report: cover, risk score, engagement metadata, findings."""
+    counts = report.findings_by_severity
+    e = report.engagement
+
+    rows = "".join(
+        f'<tr><td style="color:{SEV_COLOR[s]};font-weight:700">{SEVERITY_TITLE[s]}</td>'
+        f"<td>{counts.get(s, 0)}</td></tr>"
+        for s in Severity
+    )
+
+    engagement_html = ""
+    if e:
+        tools = "".join(f"<li>{_esc(t)}</li>" for t in (e.tools_run or [])) or "<li>Built-in checks only</li>"
+        engagement_html = f"""
+        <section>
+          <h2>Engagement details</h2>
+          <table class="meta">
+            <tr><th>Test type</th><td>{_esc(e.test_type)}</td></tr>
+            <tr><th>Target</th><td><code>{_esc(e.target)}</code></td></tr>
+            <tr><th>Started</th><td>{e.started_at.strftime('%Y-%m-%d %H:%M:%S')}</td></tr>
+            <tr><th>Completed</th><td>{e.completed_at.strftime('%Y-%m-%d %H:%M:%S')}</td></tr>
+            <tr><th>Duration</th><td>{int(e.duration_seconds)} seconds</td></tr>
+            <tr><th>Authorization</th><td>{_esc(e.authorization)}</td></tr>
+            <tr><th>Scope</th><td>{_esc(e.scope_note)}</td></tr>
+          </table>
+          <h3>Tools executed</h3><ul>{tools}</ul>
+        </section>"""
+
+    findings_html = []
+    for i, f in enumerate(report.findings, start=1):
+        refs = "".join(
+            f'<li><a href="{_esc(r)}">{_esc(r)}</a></li>' for r in f.references
+        )
+        meta = []
+        if f.cwe:
+            meta.append(f"<span class='tag'>CWE {_esc(f.cwe.removeprefix('CWE-'))}</span>")
+        if f.cve:
+            meta.append(f"<span class='tag'>{_esc(f.cve)}</span>")
+        if f.cvss:
+            meta.append(f"<span class='tag'>CVSS {f.cvss}</span>")
+        if f.owasp:
+            meta.append(f"<span class='tag'>{_esc(f.owasp)}</span>")
+        if f.mitre:
+            meta.append(f"<span class='tag'>{_esc(f.mitre)}</span>")
+        meta.append(f"<span class='tag'>confidence: {_esc(f.confidence)}</span>")
+        findings_html.append(f"""
+        <article class="finding" style="border-left-color:{SEV_COLOR[f.severity]}">
+          <header>
+            <span class="sev" style="background:{SEV_COLOR[f.severity]}">{SEVERITY_TITLE[f.severity].upper()}</span>
+            <h2>{i}. {_esc(f.title)}</h2>
+          </header>
+          <p class="tags">{' '.join(meta)}</p>
+          <table class="meta">
+            <tr><th>Priority</th><td>P{f.priority}</td></tr>
+            <tr><th>Location</th><td><code>{_esc(f.location)}</code></td></tr>
+            <tr><th>Detected by</th><td>{_esc(f.source_scanner.value if f.source_scanner else 'n/a')}</td></tr>
+          </table>
+          {'<h3>Evidence</h3><pre>' + _esc(f.evidence) + '</pre>' if f.evidence else ''}
+          <h3>What this is</h3><p>{_esc(f.explanation)}</p>
+          <h3>Impact</h3><p>{_esc(f.impact)}</p>
+          <h3>Remediation</h3><p class="fix">{_esc(f.suggested_fix)}</p>
+          {'<h3>References</h3><ul>' + refs + '</ul>' if refs else ''}
+        </article>""")
+
+    if not report.findings:
+        findings_html.append("<p><em>No findings were reported by the engines that ran.</em></p>")
+
+    return f"""<!doctype html><html><head><meta charset="utf-8">
+<title>Security Assessment — {_esc(report.target)}</title>
+<style>
+  body{{font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:#0f172a;max-width:920px;margin:0 auto;padding:40px 28px;line-height:1.55;background:#fff}}
+  h1{{font-size:26px;margin:0 0 4px}} h2{{font-size:17px;margin:26px 0 8px}} h3{{font-size:14px;margin:16px 0 6px;color:#334155;text-transform:uppercase;letter-spacing:.04em}}
+  .cover{{border-bottom:3px solid #0f172a;padding-bottom:18px;margin-bottom:24px}}
+  .badge{{display:inline-block;padding:4px 10px;border-radius:6px;color:#fff;font-weight:700;font-size:12px;letter-spacing:.04em}}
+  .score{{display:flex;gap:24px;align-items:center;margin:18px 0}}
+  .gauge{{width:92px;height:92px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:24px;font-weight:800;color:#fff}}
+  table{{border-collapse:collapse;width:100%;font-size:13.5px;margin:8px 0}}
+  th,td{{text-align:left;padding:6px 10px;border-bottom:1px solid #e2e8f0;vertical-align:top}}
+  table.meta th{{width:190px;color:#475569;font-weight:600}}
+  .finding{{border:1px solid #e2e8f0;border-left:5px solid #999;border-radius:8px;padding:16px 18px;margin:18px 0;page-break-inside:avoid}}
+  .finding h2{{margin:10px 0 0;font-size:16px}} .finding header{{display:flex;gap:10px;align-items:center}}
+  .sev{{color:#fff;font-size:10.5px;font-weight:800;padding:3px 8px;border-radius:4px;letter-spacing:.05em}}
+  .tag{{display:inline-block;background:#f1f5f9;border:1px solid #e2e8f0;border-radius:4px;padding:2px 7px;font-size:11.5px;margin-right:6px;color:#334155}}
+  pre{{background:#0f172a;color:#e2e8f0;padding:12px;border-radius:6px;overflow-x:auto;font-size:12px;white-space:pre-wrap}}
+  .fix{{white-space:pre-line}} .disclaimer{{margin-top:36px;border-top:1px solid #e2e8f0;padding-top:14px;font-size:11.5px;color:#64748b}}
+  a{{color:#1d4ed8}} @media print{{body{{padding:0}} .finding{{page-break-inside:avoid}}}}
+</style></head><body>
+<header class="cover">
+  <div style="display:flex;justify-content:space-between;align-items:baseline">
+    <h1>Security Assessment Report</h1>
+    <span class="badge" style="background:{SEV_COLOR.get(min((f.severity for f in report.findings), key=severity_rank, default=Severity.INFO), '#64748b')}">{report.risk_rating.upper()}</span>
+  </div>
+  <p style="margin:4px 0;color:#475569">{_esc(report.target)} · scan <code>{_esc(report.scan_id)}</code> · {report.timestamp.strftime('%Y-%m-%d %H:%M')}</p>
+  <div class="score">
+    <div class="gauge" style="background:{SEV_COLOR.get(min((f.severity for f in report.findings), key=severity_rank, default=Severity.INFO), '#64748b')}">{report.risk_score}</div>
+    <div><strong>Risk score {report.risk_score}/100</strong><br><span style="color:#475569">{report.total_findings} findings across {sum(1 for s in Severity if counts.get(s))} severity band(s)</span></div>
+  </div>
+  <table>{rows}</table>
+</header>
+{engagement_html}
+<section><h2>Executive summary</h2><p style="white-space:pre-line">{_esc(report.summary)}</p></section>
+{'<section><h2>Methodology</h2><ul>' + ''.join(f'<li>{_esc(m)}</li>' for m in report.methodology) + '</ul></section>' if report.methodology else ''}
+<section><h2>Detailed findings</h2>{''.join(findings_html)}</section>
+<p class="disclaimer">{_esc(report.disclaimer)}</p>
+</body></html>"""
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -668,6 +900,7 @@ async def generate_report(
     findings: list[NormalizedFinding],
     engines: Optional[list] = None,
     methodology: Optional[list[str]] = None,
+    engagement: Optional[dict] = None,
 ) -> ScanReport:
     """Build a severity-ordered, human-readable report from normalized findings."""
     from app.services.scanner import engines_used  # local import avoids a cycle
@@ -688,8 +921,10 @@ async def generate_report(
         total_findings=len(built),
         findings_by_severity=counts,
         findings=built,
+        risk_score=compute_risk_score(built),
         risk_rating=_risk_rating(built),
         methodology=methodology,
         engines=engines or [],
+        engagement=engagement,
     )
     return report

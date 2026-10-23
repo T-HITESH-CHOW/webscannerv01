@@ -153,7 +153,30 @@ class LLMFinding(BaseModel):
     cve: Optional[str] = None
     cvss: Optional[float] = None
     owasp: str = ""
+    cwe: str = ""              # e.g. "CWE-89"
+    mitre: str = ""            # e.g. "T1190 Exploit Public-Facing Application"
+    confidence: str = "medium" # high (re-verified) | medium (engine) | low (inferred)
+    verified: bool = False
     priority: int = 0          # 1 = fix first (derived from severity)
+
+
+class EngagementSummary(BaseModel):
+    """Engagement wrapper around the findings, as a real pentest deliverable has."""
+    target: str
+    scan_type: ScanType
+    started_at: datetime
+    completed_at: datetime
+    duration_seconds: float = 0.0
+    tools_run: list[str] = []          # what actually executed
+    authorization: str = (
+        "Client-authorized assessment. The engagement owner confirmed written "
+        "permission for the target in scope."
+    )
+    scope_note: str = (
+        "Single target, same-origin only. No out-of-scope hosts, tenants or "
+        "down-stream systems were tested."
+    )
+    test_type: str = "External grey-box automated assessment (web application)"
 
 
 class ScanReport(BaseModel):
@@ -167,6 +190,8 @@ class ScanReport(BaseModel):
     # findings are always sorted worst-first (critical -> info)
     findings: list[LLMFinding]
     # New v1 fields
+    risk_score: int = 0                      # 0-100, weighted by severity and confidence
+    engagement: Optional[EngagementSummary] = None
     risk_rating: str = "informational"       # overall risk (e.g. critical/high/...)
     methodology: list[str] = []              # engines that actually ran
     engines: list[EngineStatus] = []         # availability of every engine

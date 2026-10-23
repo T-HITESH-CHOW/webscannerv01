@@ -143,13 +143,22 @@ ENGINE_SPECS: tuple[EngineSpec, ...] = (
 )
 
 
+TOOL_DIR = Path(__file__).resolve().parents[3] / "tools" / "bin"
+
+
 def _which(*candidates: str) -> Optional[str]:
+    """Locate an engine on PATH, or in the project's bundled tools/bin."""
     for cmd in candidates:
         if not cmd:
             continue
         found = shutil.which(cmd)
         if found:
             return found
+        # Bundled offline installs (tools/bin/trivy.exe, nuclei.exe ...)
+        for name in (cmd, f"{cmd}.exe"):
+            local = TOOL_DIR / name
+            if local.exists():
+                return str(local)
     return None
 
 

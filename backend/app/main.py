@@ -10,7 +10,6 @@ settings = get_settings()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: create directories
     import os
     os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
     os.makedirs(settings.REPORTS_DIR, exist_ok=True)
@@ -26,16 +25,13 @@ app = FastAPI(
     redoc_url="/redoc",
 )
 
-# CORS for frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=["*"],    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Include routes
 app.include_router(routes.router, prefix="/api/v1")
 
 
